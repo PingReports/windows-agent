@@ -20,7 +20,7 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 Set-StrictMode -Version 2
 
-$AgentVersion = '0.1.0'
+$AgentVersion = '0.2.0'
 
 function Read-AgentConfig {
     param([string]$Path)
