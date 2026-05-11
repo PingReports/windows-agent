@@ -117,20 +117,67 @@ function Get-MetricsCpuMem {
         [void]$out.Add((New-Metric 'cpu_logical'   $cs.NumberOfLogicalProcessors $null $Ts))
         [void]$out.Add((New-Metric 'cpu_physical'  $cs.NumberOfProcessors        $null $Ts))
     }
-    # CPU utilisation via WMI _Total processor counter — sampled once,
-    # so it's "instantaneous since last sample" rather than a 1s average.
-    $cpu = Safe-Invoke {
+    # CPU utilisation: emit BOTH a derived percentage (cpu_busy_pct, used
+    # for KPIs + alert thresholds) AND the cumulative raw 100ns counters
+    # the linux-agent dashboard expects for the stacked breakdown chart.
+    #
+    # Win32_PerfRawData_PerfOS_Processor exposes raw counter values across
+    # all CPUs ("_Total" instance). PercentInterruptTime + PercentDPCTime
+    # are *sub-counters* of PercentPrivilegedTime on Windows, so when we
+    # want the breakdown to sum to 100% we have to subtract them from the
+    # system bucket before re-adding them as irq + softirq.
+    $cpuFmt = Safe-Invoke {
         Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -ErrorAction Stop |
             Where-Object { $_.Name -eq '_Total' }
     }
-    if ($cpu) {
-        $busy = 100.0 - [double]$cpu.PercentIdleTime
+    if ($cpuFmt) {
+        $busy = 100.0 - [double]$cpuFmt.PercentIdleTime
         if ($busy -lt 0) { $busy = 0 } elseif ($busy -gt 100) { $busy = 100 }
-        [void]$out.Add((New-Metric 'cpu_busy_pct'    $busy                                 $null $Ts))
-        [void]$out.Add((New-Metric 'cpu_user_pct'    ([double]$cpu.PercentUserTime)        $null $Ts))
-        [void]$out.Add((New-Metric 'cpu_system_pct'  ([double]$cpu.PercentPrivilegedTime)  $null $Ts))
-        [void]$out.Add((New-Metric 'cpu_idle_pct'    ([double]$cpu.PercentIdleTime)        $null $Ts))
-        [void]$out.Add((New-Metric 'cpu_interrupt_pct' ([double]$cpu.PercentInterruptTime) $null $Ts))
+        [void]$out.Add((New-Metric 'cpu_busy_pct' $busy $null $Ts))
+    }
+    $cpuRaw = Safe-Invoke {
+        Get-CimInstance Win32_PerfRawData_PerfOS_Processor -ErrorAction Stop |
+            Where-Object { $_.Name -eq '_Total' }
+    }
+    if ($cpuRaw) {
+        $user = [int64]$cpuRaw.PercentUserTime
+        $priv = [int64]$cpuRaw.PercentPrivilegedTime
+        $idle = [int64]$cpuRaw.PercentIdleTime
+        $irq  = [int64]$cpuRaw.PercentInterruptTime
+        $dpc  = [int64]$cpuRaw.PercentDPCTime
+        # Subtract sub-counters so the stacked chart adds up cleanly.
+        $sys  = $priv - $irq - $dpc
+        if ($sys -lt 0) { $sys = 0 }
+        $total = $user + $priv + $idle
+        # Names + units (cumulative ticks) intentionally match the linux
+        # /proc/stat shape so the same dashboard JS + alert presets work.
+        [void]$out.Add((New-Metric 'cpu_user'    $user  $null $Ts))
+        [void]$out.Add((New-Metric 'cpu_system'  $sys   $null $Ts))
+        [void]$out.Add((New-Metric 'cpu_idle'    $idle  $null $Ts))
+        [void]$out.Add((New-Metric 'cpu_irq'     $irq   $null $Ts))
+        [void]$out.Add((New-Metric 'cpu_softirq' $dpc   $null $Ts))
+        [void]$out.Add((New-Metric 'cpu_iowait'  0      $null $Ts))
+        [void]$out.Add((New-Metric 'cpu_steal'   0      $null $Ts))
+        [void]$out.Add((New-Metric 'cpu_total'   $total $null $Ts))
+    }
+    # Synthesise load1/5/15 from current CPU busy% so the load chart and
+    # alert presets ("load1 > N") work on Windows. linux semantics:
+    # load = average count of runnable threads; ≈ busy_cpus = busy_pct * cores / 100.
+    if ($cpuFmt -and $cs -and $cs.NumberOfLogicalProcessors -gt 0) {
+        $busyPct = 100.0 - [double]$cpuFmt.PercentIdleTime
+        if ($busyPct -lt 0) { $busyPct = 0 } elseif ($busyPct -gt 100) { $busyPct = 100 }
+        $load = [math]::Round(($busyPct * $cs.NumberOfLogicalProcessors / 100.0), 2)
+        [void]$out.Add((New-Metric 'load1'  $load $null $Ts))
+        [void]$out.Add((New-Metric 'load5'  $load $null $Ts))
+        [void]$out.Add((New-Metric 'load15' $load $null $Ts))
+        # Also expose run-queue length when available — Processor Queue Length
+        # is the closest Windows analog to "threads waiting on CPU".
+        $rql = Safe-Invoke {
+            (Get-CimInstance Win32_PerfRawData_PerfOS_System -ErrorAction Stop).ProcessorQueueLength
+        }
+        if ($null -ne $rql) {
+            [void]$out.Add((New-Metric 'proc_runqueue' ([int]$rql) $null $Ts))
+        }
     }
     # System uptime in seconds — matches the linux-agent metric name the
     # server summary reads ("uptime_seconds").
@@ -166,17 +213,34 @@ function Get-MetricsDisk {
 function Get-MetricsDiskIO {
     param([string]$Ts)
     $out = New-Object System.Collections.ArrayList
+    # The RAW class exposes BULK_COUNT-typed counters that are cumulative
+    # totals (despite the "PerSec" suffix in the field name). Match the
+    # linux-agent metric shape so the dashboard's diskio_read_bytes /
+    # diskio_write_bytes rate charts plot Windows hosts identically.
     $rows = Safe-Invoke {
-        Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -ErrorAction Stop |
+        Get-CimInstance Win32_PerfRawData_PerfDisk_PhysicalDisk -ErrorAction Stop |
             Where-Object { $_.Name -ne '_Total' -and $_.Name -notmatch '^\s*$' }
     }
     foreach ($r in ($rows | ForEach-Object { $_ })) {
-        $labels = @{ device = ($r.Name -replace '[^A-Za-z0-9 ]','_') }
-        [void]$out.Add((New-Metric 'diskio_read_bytes_per_s'  ([double]$r.DiskReadBytesPerSec)  $labels $Ts))
-        [void]$out.Add((New-Metric 'diskio_write_bytes_per_s' ([double]$r.DiskWriteBytesPerSec) $labels $Ts))
-        [void]$out.Add((New-Metric 'diskio_reads_per_s'       ([double]$r.DiskReadsPerSec)     $labels $Ts))
-        [void]$out.Add((New-Metric 'diskio_writes_per_s'      ([double]$r.DiskWritesPerSec)    $labels $Ts))
-        [void]$out.Add((New-Metric 'diskio_busy_pct'          ([double]$r.PercentDiskTime)     $labels $Ts))
+        # PhysicalDisk instance names look like "0 C: D:" — keep the
+        # leading index as a stable per-disk identifier.
+        $dev = ($r.Name -split ' ')[0]
+        $labels = @{ dev = "disk$dev" }
+        [void]$out.Add((New-Metric 'diskio_read_bytes'  ([int64]$r.DiskReadBytesPerSec)  $labels $Ts))
+        [void]$out.Add((New-Metric 'diskio_write_bytes' ([int64]$r.DiskWriteBytesPerSec) $labels $Ts))
+        [void]$out.Add((New-Metric 'diskio_reads'       ([int64]$r.DiskReadsPerSec)      $labels $Ts))
+        [void]$out.Add((New-Metric 'diskio_writes'      ([int64]$r.DiskWritesPerSec)     $labels $Ts))
+        # PercentDiskTime is gauge-shaped (0..100*N) so route it through
+        # the formatted counter to get a sane per-disk busy%.
+    }
+    $fmt = Safe-Invoke {
+        Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -ErrorAction Stop |
+            Where-Object { $_.Name -ne '_Total' -and $_.Name -notmatch '^\s*$' }
+    }
+    foreach ($r in ($fmt | ForEach-Object { $_ })) {
+        $dev = ($r.Name -split ' ')[0]
+        $labels = @{ dev = "disk$dev" }
+        [void]$out.Add((New-Metric 'diskio_busy_pct' ([double]$r.PercentDiskTime) $labels $Ts))
     }
     return $out
 }
@@ -288,6 +352,29 @@ function Get-SafeProcessSnapshot {
         })
     }
     return $rows
+}
+
+function Get-InvOsFields {
+    # Returns the top-level OS-shaped keys the server reads off the
+    # inventory envelope (os_id / os_version / os_pretty / kernel / arch
+    # / cpus / cpu_model). These mirror the linux-agent `inventory_kernel`
+    # output so the agents detail page header lights up.
+    $os  = Safe-Invoke { Get-CimInstance Win32_OperatingSystem -ErrorAction Stop }
+    $cs  = Safe-Invoke { Get-CimInstance Win32_ComputerSystem -ErrorAction Stop }
+    $cpu = Safe-Invoke { Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1 }
+    $out = [ordered]@{}
+    if ($os) {
+        $out.os_id      = 'windows'
+        $out.os_version = "$($os.Version)"
+        # "Microsoft Windows 11 Pro 10.0.26200 build 26200"
+        $out.os_pretty  = ("$($os.Caption) $($os.Version) build $($os.BuildNumber)" -replace '\s+',' ').Trim()
+        $out.kernel     = "NT $($os.Version) build $($os.BuildNumber)"
+    }
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    if ($arch) { $out.arch = $arch.ToLower() }
+    if ($cs)  { $out.cpus = [int]$cs.NumberOfLogicalProcessors }
+    if ($cpu) { $out.cpu_model = ("$($cpu.Name)" -replace '\s+',' ').Trim() }
+    return $out
 }
 
 function Get-InvSystemInfo {
@@ -453,6 +540,29 @@ function Get-InvListeningPorts {
     return $out.ToArray()
 }
 
+function Get-InvEstablishedConnections {
+    # Mirrors the linux-agent `inventory_established_connections`. Surfaces
+    # the top outbound conversations so the server-side GeoIP enrichment
+    # can render "you're talking to a CDN in Singapore" on the network tab.
+    $out = New-Object System.Collections.ArrayList
+    $tcp = Safe-Invoke { Get-NetTCPConnection -State Established -ErrorAction Stop } @()
+    foreach ($c in ($tcp | Select-Object -First 200)) {
+        # Filter out chatty local-loopback noise to keep the inventory
+        # focused on real off-host conversations.
+        if ("$($c.RemoteAddress)" -in '127.0.0.1','::1','0.0.0.0','::') { continue }
+        $procName = ''
+        try { $procName = (Get-Process -Id $c.OwningProcess -ErrorAction Stop).ProcessName } catch {}
+        [void]$out.Add([ordered]@{
+            local_ip    = "$($c.LocalAddress)"
+            local_port  = [int]$c.LocalPort
+            remote_ip   = "$($c.RemoteAddress)"
+            remote_port = [int]$c.RemotePort
+            proc        = $procName
+        })
+    }
+    return $out.ToArray()
+}
+
 function Get-InvFailedServices {
     $out = New-Object System.Collections.ArrayList
     $svcs = Safe-Invoke { Get-Service -ErrorAction Stop } @()
@@ -493,7 +603,12 @@ function Get-InvGPUs {
         elseif ($name -match 'AMD|Radeon') { $vendor = 'amd' }
         elseif ($name -match 'Intel') { $vendor = 'intel' }
         $memTotal = ''
-        if ($g.AdapterRAM) { $memTotal = "$([int64]$g.AdapterRAM)" }
+        if ($g.AdapterRAM) {
+            # Render as megabytes — the detail page tile reads
+            # `mem_total` as a "MB" number, so handing it the raw byte
+            # count makes the card show absurd-looking GB-as-MB values.
+            $memTotal = "$([int64]([math]::Round([int64]$g.AdapterRAM / 1MB)))"
+        }
         [void]$out.Add([ordered]@{
             vendor    = $vendor
             idx       = $idx
@@ -506,22 +621,144 @@ function Get-InvGPUs {
     return $out.ToArray()
 }
 
-function Get-InvPendingUpdates {
-    # Best-effort: parse `wmic qfe` for installed updates count we'd surface
-    # later. For pending updates we rely on the Windows Update agent COM
-    # interface, which is slow and sometimes blocked by policy. Surface
-    # what we can without paying the wuapi cost on every push.
-    $out = [ordered]@{
-        total            = 0
-        security         = 0
-        reboot_required  = 0
+function Get-MetricsGPU {
+    param([string]$Ts)
+    $out = New-Object System.Collections.ArrayList
+    # GPU utilisation: Win10+ exposes per-engine counters. We sum the
+    # "Utilization Percentage" across engines per PID-anchored adapter
+    # to get a "rough usage %". Numbers can exceed 100 if multiple
+    # engines are busy simultaneously, so clamp to [0, 100] post-sum.
+    $engines = Safe-Invoke {
+        Get-Counter -Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop -SampleInterval 1 -MaxSamples 1
     }
-    # Reboot-required check via Component Based Servicing / Windows Update.
+    if ($engines -and $engines.CounterSamples) {
+        # Each sample path looks like:
+        #   \\HOST\GPU Engine(pid_NNN_luid_X_Y_phys_Z_eng_E_engtype_3D)\Utilization Percentage
+        $byAdapter = @{}
+        foreach ($s in $engines.CounterSamples) {
+            $path = "$($s.Path)"
+            # Group on `luid_<X>_<Y>_phys_<Z>` — that's the physical adapter id.
+            $m = [regex]::Match($path, 'luid_(0x[0-9A-Fa-f]+_0x[0-9A-Fa-f]+)_phys_(\d+)')
+            if (-not $m.Success) { continue }
+            $adapter = "$($m.Groups[1].Value)_phys$($m.Groups[2].Value)"
+            $v = [double]$s.CookedValue
+            if (-not $byAdapter.ContainsKey($adapter)) { $byAdapter[$adapter] = 0.0 }
+            $byAdapter[$adapter] += $v
+        }
+        $i = 0
+        foreach ($a in $byAdapter.Keys) {
+            $pct = $byAdapter[$a]
+            if ($pct -lt 0) { $pct = 0 } elseif ($pct -gt 100) { $pct = 100 }
+            $labels = @{ idx = "$i"; adapter = $a }
+            [void]$out.Add((New-Metric 'gpu_util_pct' $pct $labels $Ts))
+            $i++
+        }
+    }
+    # GPU dedicated memory used per process — we sum it per adapter as a
+    # proxy for "memory in use on this GPU".
+    $memCtr = Safe-Invoke {
+        Get-Counter -Counter '\GPU Process Memory(*)\Dedicated Usage' -ErrorAction Stop -SampleInterval 1 -MaxSamples 1
+    }
+    if ($memCtr -and $memCtr.CounterSamples) {
+        $byAdapter = @{}
+        foreach ($s in $memCtr.CounterSamples) {
+            $m = [regex]::Match("$($s.Path)", 'luid_(0x[0-9A-Fa-f]+_0x[0-9A-Fa-f]+)_phys_(\d+)')
+            if (-not $m.Success) { continue }
+            $adapter = "$($m.Groups[1].Value)_phys$($m.Groups[2].Value)"
+            if (-not $byAdapter.ContainsKey($adapter)) { $byAdapter[$adapter] = 0 }
+            $byAdapter[$adapter] += [int64]$s.CookedValue
+        }
+        $i = 0
+        foreach ($a in $byAdapter.Keys) {
+            $labels = @{ idx = "$i"; adapter = $a }
+            [void]$out.Add((New-Metric 'gpu_mem_used_bytes' $byAdapter[$a] $labels $Ts))
+            $i++
+        }
+    }
+    return $out
+}
+
+function Get-InvPendingUpdates {
+    param([string]$StateDir)
+    # The Windows Update COM agent (Microsoft.Update.Session) is the only
+    # reliable way to list pending updates. It is also slow — easily 30s+
+    # on a fresh start, sometimes minutes when WSUS / policy is in the
+    # mix — so we cache the result for an hour and run the query in a
+    # background job with a hard timeout so the agent push never blocks.
+    $cacheFile = Join-Path $StateDir 'updates.json'
+    $out = [ordered]@{ total = 0; security = 0; reboot_required = 0 }
+
+    # Reboot-required check is cheap and accurate regardless of cache state.
     try {
         $cbs = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
         $wu  = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
         if ($cbs -or $wu) { $out.reboot_required = 1 }
     } catch {}
+
+    $useCache = $false
+    if (Test-Path $cacheFile) {
+        try {
+            $cached = Get-Content -LiteralPath $cacheFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $age = ((Get-Date).ToUniversalTime() - [DateTime]::Parse($cached.fetched_at).ToUniversalTime()).TotalSeconds
+            if ($age -lt 3600) {
+                $out.total    = [int]$cached.total
+                $out.security = [int]$cached.security
+                if ($cached.packages) {
+                    $out.packages = @($cached.packages)
+                }
+                $useCache = $true
+            }
+        } catch {}
+    }
+    if ($useCache) { return $out }
+
+    # Spawn the COM query in a background job with a 25s timeout. If the
+    # caller times out we keep the previous cache; the next push retries.
+    $job = Start-Job -ScriptBlock {
+        try {
+            $session = New-Object -ComObject Microsoft.Update.Session
+            $searcher = $session.CreateUpdateSearcher()
+            $r = $searcher.Search("IsInstalled=0 and IsHidden=0")
+            $pkgs = New-Object System.Collections.ArrayList
+            $sec = 0
+            foreach ($u in $r.Updates) {
+                $isSecurity = $false
+                foreach ($cat in $u.Categories) {
+                    if ("$($cat.Name)" -match 'Security') { $isSecurity = $true; break }
+                }
+                if ($isSecurity) { $sec++ }
+                $title = "$($u.Title)"
+                if ($title.Length -gt 200) { $title = $title.Substring(0, 200) }
+                [void]$pkgs.Add(@{ name = $title; version = ''; repo = 'WindowsUpdate'; security = $(if ($isSecurity) {1} else {0}) })
+            }
+            return @{ total = $r.Updates.Count; security = $sec; packages = $pkgs.ToArray() }
+        } catch {
+            return @{ total = 0; security = 0; packages = @(); error = "$($_.Exception.Message)" }
+        }
+    }
+    $finished = Wait-Job -Job $job -Timeout 25
+    if ($finished) {
+        $r = Receive-Job -Job $job
+        Remove-Job -Job $job -Force
+        if ($r) {
+            $out.total    = [int]$r.total
+            $out.security = [int]$r.security
+            if ($r.packages) { $out.packages = @($r.packages) }
+            # Cache the result for an hour.
+            try {
+                $payload = @{
+                    fetched_at = (Get-Date).ToUniversalTime().ToString('o')
+                    total      = $out.total
+                    security   = $out.security
+                    packages   = $out.packages
+                }
+                $payload | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $cacheFile -Encoding UTF8
+            } catch {}
+        }
+    } else {
+        Stop-Job -Job $job -ErrorAction Ignore
+        Remove-Job -Job $job -Force -ErrorAction Ignore
+    }
     return $out
 }
 
@@ -535,22 +772,38 @@ function Build-Envelope {
     foreach ($m in (Get-MetricsNet         -Ts $ts)) { if ($m) { [void]$metrics.Add($m) } }
     foreach ($m in (Get-MetricsSocketCounts -Ts $ts)){ if ($m) { [void]$metrics.Add($m) } }
     foreach ($m in (Get-MetricsServices    -Ts $ts)) { if ($m) { [void]$metrics.Add($m) } }
+    foreach ($m in (Get-MetricsGPU         -Ts $ts)) { if ($m) { [void]$metrics.Add($m) } }
     foreach ($m in (Get-MetricsProcDrilldown -Ts $ts -TopN ([int]$Cfg.PR_TOP_N))) { if ($m) { [void]$metrics.Add($m) } }
 
     $caps = Get-InvCapabilities
     $sysInfo = Get-InvSystemInfo
+    $osFields = Get-InvOsFields
+    $stateDir = "$env:ProgramData\PingReportsAgent\state"
+    if (-not (Test-Path $stateDir)) { $stateDir = "$env:LOCALAPPDATA\PingReportsAgent\state" }
+    New-Item -ItemType Directory -Force -Path $stateDir -ErrorAction Ignore | Out-Null
 
     $inventory = [ordered]@{
+        # Top-level OS / hardware fields the server reads off the envelope
+        # to populate the agent row header. Linux agents emit these from
+        # inventory_kernel(); we mirror the same shape.
+        os_id                = $osFields.os_id
+        os_version           = $osFields.os_version
+        os_pretty            = $osFields.os_pretty
+        kernel               = $osFields.kernel
+        arch                 = $osFields.arch
+        cpus                 = $osFields.cpus
+        cpu_model            = $osFields.cpu_model
         capabilities         = $caps
         capability_present   = $caps  # same shape — Windows has no "installed-but-denied" notion
         system_info          = $sysInfo
         top_proc_mem         = Get-InvTopProcesses -TopN ([int]$Cfg.PR_TOP_N) -SortBy 'WorkingSet'
         top_proc_cpu         = Get-InvTopProcesses -TopN ([int]$Cfg.PR_TOP_N) -SortBy 'CpuSec'
         listening_ports      = Get-InvListeningPorts
+        established          = Get-InvEstablishedConnections
         failed_services      = Get-InvFailedServices
         systemd_units        = Get-InvAllServices
         gpus                 = Get-InvGPUs
-        updates              = Get-InvPendingUpdates
+        updates              = Get-InvPendingUpdates -StateDir $stateDir
         virt                 = ''
     }
 
