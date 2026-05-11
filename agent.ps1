@@ -110,7 +110,7 @@ function Get-MetricsCpuMem {
             $pct = (100.0 * $memUsedKb / $memTotalKb)
             [void]$out.Add((New-Metric 'mem_used_pct' $pct $null $Ts))
         }
-        [void]$out.Add((New-Metric 'proc_total'  $os.NumberOfProcesses $null $Ts))
+        [void]$out.Add((New-Metric 'proc_count'  $os.NumberOfProcesses $null $Ts))
         [void]$out.Add((New-Metric 'users_logged_in' $os.NumberOfUsers $null $Ts))
     }
     if ($cs) {
@@ -132,10 +132,11 @@ function Get-MetricsCpuMem {
         [void]$out.Add((New-Metric 'cpu_idle_pct'    ([double]$cpu.PercentIdleTime)        $null $Ts))
         [void]$out.Add((New-Metric 'cpu_interrupt_pct' ([double]$cpu.PercentInterruptTime) $null $Ts))
     }
-    # System uptime in seconds (mirrors linux-agent `uptime`).
+    # System uptime in seconds — matches the linux-agent metric name the
+    # server summary reads ("uptime_seconds").
     if ($os -and $os.LastBootUpTime) {
         $uptime = [int]((Get-Date) - $os.LastBootUpTime).TotalSeconds
-        [void]$out.Add((New-Metric 'uptime' $uptime $null $Ts))
+        [void]$out.Add((New-Metric 'uptime_seconds' $uptime $null $Ts))
     }
     return $out
 }
@@ -205,15 +206,21 @@ function Get-MetricsSocketCounts {
     if ($tcp) {
         $byState = $tcp | Group-Object State
         $total = ($tcp | Measure-Object).Count
-        [void]$out.Add((New-Metric 'sock_tcp_total' $total $null $Ts))
+        # linux-style names so the existing summary + alert presets fire
+        # on Windows hosts too.
+        [void]$out.Add((New-Metric 'sock_total'      $total $null $Ts))
+        $estabCount = ($tcp | Where-Object { $_.State -eq 'Established' } | Measure-Object).Count
+        $twCount    = ($tcp | Where-Object { $_.State -eq 'TimeWait' } | Measure-Object).Count
+        [void]$out.Add((New-Metric 'sock_tcp_inuse'  $estabCount $null $Ts))
+        [void]$out.Add((New-Metric 'sock_tcp_tw'     $twCount    $null $Ts))
         foreach ($g in $byState) {
-            $labels = @{ state = $g.Name }
-            [void]$out.Add((New-Metric 'sock_tcp_by_state' $g.Count $labels $Ts))
+            $labels = @{ kind = 'tcp'; state = $g.Name }
+            [void]$out.Add((New-Metric 'sock_state' $g.Count $labels $Ts))
         }
     }
     $udp = Safe-Invoke { (Get-NetUDPEndpoint -ErrorAction Stop | Measure-Object).Count }
     if ($null -ne $udp) {
-        [void]$out.Add((New-Metric 'sock_udp_total' $udp $null $Ts))
+        [void]$out.Add((New-Metric 'sock_udp_inuse' $udp $null $Ts))
     }
     return $out
 }
@@ -224,36 +231,63 @@ function Get-MetricsServices {
     $svcs = Safe-Invoke { Get-Service -ErrorAction Stop }
     if (-not $svcs) { return $out }
     $running = ($svcs | Where-Object { $_.Status -eq 'Running' } | Measure-Object).Count
-    $stopped = ($svcs | Where-Object { $_.Status -eq 'Stopped' } | Measure-Object).Count
+    # "failed" on Windows = auto-start services that aren't running. Closest
+    # analog to the linux-agent "systemd_units_failed" surface.
+    $failed = ($svcs | Where-Object { $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running' } | Measure-Object).Count
     $total   = ($svcs | Measure-Object).Count
-    [void]$out.Add((New-Metric 'units_total'  $total   $null $Ts))
-    [void]$out.Add((New-Metric 'units_active' $running $null $Ts))
-    [void]$out.Add((New-Metric 'units_failed' $stopped $null $Ts))
+    [void]$out.Add((New-Metric 'systemd_units_total'  $total   $null $Ts))
+    [void]$out.Add((New-Metric 'systemd_units_active' $running $null $Ts))
+    [void]$out.Add((New-Metric 'systemd_units_failed' $failed  $null $Ts))
     return $out
 }
 
 function Get-MetricsProcDrilldown {
     param([string]$Ts, [int]$TopN)
     $out = New-Object System.Collections.ArrayList
-    $procs = Safe-Invoke { Get-Process -ErrorAction Stop }
-    if (-not $procs) { return $out }
-    $topCpu = $procs | Sort-Object -Property CPU -Descending | Select-Object -First $TopN
-    $topMem = $procs | Sort-Object -Property WorkingSet -Descending | Select-Object -First $TopN
+    $rows = Get-SafeProcessSnapshot
+    if (-not $rows -or $rows.Count -eq 0) { return $out }
+    $topCpu = $rows | Sort-Object -Property CpuSec     -Descending | Select-Object -First $TopN
+    $topMem = $rows | Sort-Object -Property WorkingSet -Descending | Select-Object -First $TopN
     $seen = @{}
-    foreach ($p in ($topCpu + $topMem)) {
-        if (-not $p.ProcessName) { continue }
-        if ($seen.ContainsKey($p.ProcessName)) { continue }
-        $seen[$p.ProcessName] = $true
-        $labels = @{ comm = $p.ProcessName }
-        # CPU here is cumulative seconds since process start — emit as
-        # `proc_cpu_seconds` so the dashboard can take a rate if it wants.
-        $cpuSec = $null
-        try { $cpuSec = [double]$p.CPU } catch { $cpuSec = $null }
-        if ($null -ne $cpuSec) { [void]$out.Add((New-Metric 'proc_cpu_seconds' $cpuSec $labels $Ts)) }
+    foreach ($p in (@($topCpu) + @($topMem))) {
+        if (-not $p.Name) { continue }
+        if ($seen.ContainsKey($p.Name)) { continue }
+        $seen[$p.Name] = $true
+        $labels = @{ comm = $p.Name }
+        [void]$out.Add((New-Metric 'proc_cpu_seconds' $p.CpuSec $labels $Ts))
         $rssKb = [int64]([math]::Round($p.WorkingSet / 1024))
         [void]$out.Add((New-Metric 'proc_rss_kb' $rssKb $labels $Ts))
     }
     return $out
+}
+
+function Get-SafeProcessSnapshot {
+    # Project Get-Process into a uniform shape with each field guarded so
+    # a single inaccessible process (system service we can't open) can't
+    # nuke Sort-Object via a "property not found" exception.
+    $procs = Safe-Invoke { Get-Process -ErrorAction Stop } @()
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($p in ($procs | ForEach-Object { $_ })) {
+        $cpuSec = 0.0
+        try {
+            $cpuObj = $p.PSObject.Properties['CPU']
+            if ($cpuObj -and $null -ne $cpuObj.Value) { $cpuSec = [double]$cpuObj.Value }
+        } catch {}
+        $ws = 0
+        try { $ws = [int64]$p.WorkingSet64 } catch {
+            try { $ws = [int64]$p.WorkingSet } catch {}
+        }
+        $threads = 0
+        try { $threads = [int]$p.Threads.Count } catch {}
+        [void]$rows.Add([pscustomobject]@{
+            Id         = [int]$p.Id
+            Name       = "$($p.ProcessName)"
+            CpuSec     = $cpuSec
+            WorkingSet = $ws
+            Threads    = $threads
+        })
+    }
+    return $rows
 }
 
 function Get-InvSystemInfo {
@@ -372,21 +406,20 @@ function Get-InvDocker {
 }
 
 function Get-InvTopProcesses {
-    param([int]$TopN)
-    $procs = Safe-Invoke { Get-Process -ErrorAction Stop } @()
+    param([int]$TopN, [string]$SortBy = 'WorkingSet')
+    $rows = Get-SafeProcessSnapshot
+    if (-not $rows -or $rows.Count -eq 0) { return @() }
     $out = New-Object System.Collections.ArrayList
-    foreach ($p in ($procs | Sort-Object -Property WorkingSet -Descending | Select-Object -First $TopN)) {
+    foreach ($p in ($rows | Sort-Object -Property $SortBy -Descending | Select-Object -First $TopN)) {
         $rssKb = [int64]([math]::Round($p.WorkingSet / 1024))
-        $cpuSec = $null
-        try { $cpuSec = [double]$p.CPU } catch { $cpuSec = 0 }
         [void]$out.Add([ordered]@{
             pid     = [int]$p.Id
             user    = ''
-            cpu     = $cpuSec
+            cpu     = [double]$p.CpuSec
             rss_kb  = $rssKb
-            comm    = "$($p.ProcessName)"
-            args    = "$($p.MainWindowTitle)"
-            threads = [int]$p.Threads.Count
+            comm    = $p.Name
+            args    = ''
+            threads = [int]$p.Threads
             state   = 'R'
         })
     }
@@ -511,8 +544,8 @@ function Build-Envelope {
         capabilities         = $caps
         capability_present   = $caps  # same shape — Windows has no "installed-but-denied" notion
         system_info          = $sysInfo
-        top_proc_mem         = Get-InvTopProcesses -TopN ([int]$Cfg.PR_TOP_N)
-        top_proc_cpu         = Get-InvTopProcesses -TopN ([int]$Cfg.PR_TOP_N)
+        top_proc_mem         = Get-InvTopProcesses -TopN ([int]$Cfg.PR_TOP_N) -SortBy 'WorkingSet'
+        top_proc_cpu         = Get-InvTopProcesses -TopN ([int]$Cfg.PR_TOP_N) -SortBy 'CpuSec'
         listening_ports      = Get-InvListeningPorts
         failed_services      = Get-InvFailedServices
         systemd_units        = Get-InvAllServices
