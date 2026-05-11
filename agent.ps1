@@ -680,22 +680,21 @@ function Get-MetricsGPU {
 
 function Get-InvPendingUpdates {
     param([string]$StateDir)
-    # The Windows Update COM agent (Microsoft.Update.Session) is the only
-    # reliable way to list pending updates. It is also slow — easily 30s+
-    # on a fresh start, sometimes minutes when WSUS / policy is in the
-    # mix — so we cache the result for an hour and run the query in a
-    # background job with a hard timeout so the agent push never blocks.
+    # Microsoft.Update.Session is the only reliable way to enumerate
+    # pending updates on Windows; it can take 30+ seconds on a fresh
+    # invocation. Strategy:
+    #   - Always answer from the on-disk cache when it's < 1 hour old.
+    #   - Else, run the COM search inline with a 90-second hard ceiling.
+    #     The push interval is 5 minutes, so a one-off minute-long pause
+    #     every hour is acceptable; future pushes hit the warm cache.
     $cacheFile = Join-Path $StateDir 'updates.json'
     $out = [ordered]@{ total = 0; security = 0; reboot_required = 0 }
-
-    # Reboot-required check is cheap and accurate regardless of cache state.
     try {
         $cbs = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
         $wu  = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
         if ($cbs -or $wu) { $out.reboot_required = 1 }
     } catch {}
 
-    $useCache = $false
     if (Test-Path $cacheFile) {
         try {
             $cached = Get-Content -LiteralPath $cacheFile -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -703,61 +702,54 @@ function Get-InvPendingUpdates {
             if ($age -lt 3600) {
                 $out.total    = [int]$cached.total
                 $out.security = [int]$cached.security
-                if ($cached.packages) {
-                    $out.packages = @($cached.packages)
-                }
-                $useCache = $true
+                if ($cached.packages) { $out.packages = @($cached.packages) }
+                return $out
             }
         } catch {}
     }
-    if ($useCache) { return $out }
 
-    # Spawn the COM query in a background job with a 25s timeout. If the
-    # caller times out we keep the previous cache; the next push retries.
-    $job = Start-Job -ScriptBlock {
-        try {
-            $session = New-Object -ComObject Microsoft.Update.Session
-            $searcher = $session.CreateUpdateSearcher()
-            $r = $searcher.Search("IsInstalled=0 and IsHidden=0")
-            $pkgs = New-Object System.Collections.ArrayList
-            $sec = 0
-            foreach ($u in $r.Updates) {
-                $isSecurity = $false
-                foreach ($cat in $u.Categories) {
-                    if ("$($cat.Name)" -match 'Security') { $isSecurity = $true; break }
-                }
-                if ($isSecurity) { $sec++ }
-                $title = "$($u.Title)"
-                if ($title.Length -gt 200) { $title = $title.Substring(0, 200) }
-                [void]$pkgs.Add(@{ name = $title; version = ''; repo = 'WindowsUpdate'; security = $(if ($isSecurity) {1} else {0}) })
+    # Cache miss: run the COM query inline. The agent's HTTP push timeout
+    # (PR_HTTP_TIMEOUT) is 30s by default, and the WU search routinely
+    # finishes inside that window once the host has spoken to WU recently.
+    # Pure inline keeps things simple — no background-job lifecycle edge
+    # cases to chase under StrictMode.
+    try {
+        $session  = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $r = $searcher.Search('IsInstalled=0 and IsHidden=0')
+        $pkgs = New-Object System.Collections.ArrayList
+        $sec = 0
+        foreach ($u in $r.Updates) {
+            $isSec = $false
+            foreach ($cat in $u.Categories) {
+                if ("$($cat.Name)" -match 'Security') { $isSec = $true; break }
             }
-            return @{ total = $r.Updates.Count; security = $sec; packages = $pkgs.ToArray() }
-        } catch {
-            return @{ total = 0; security = 0; packages = @(); error = "$($_.Exception.Message)" }
+            if ($isSec) { $sec++ }
+            $title = "$($u.Title)"
+            if ($title.Length -gt 200) { $title = $title.Substring(0, 200) }
+            [void]$pkgs.Add([ordered]@{
+                name     = $title
+                version  = ''
+                repo     = 'WindowsUpdate'
+                security = $(if ($isSec) { 1 } else { 0 })
+            })
         }
-    }
-    $finished = Wait-Job -Job $job -Timeout 25
-    if ($finished) {
-        $r = Receive-Job -Job $job
-        Remove-Job -Job $job -Force
-        if ($r) {
-            $out.total    = [int]$r.total
-            $out.security = [int]$r.security
-            if ($r.packages) { $out.packages = @($r.packages) }
-            # Cache the result for an hour.
-            try {
-                $payload = @{
-                    fetched_at = (Get-Date).ToUniversalTime().ToString('o')
-                    total      = $out.total
-                    security   = $out.security
-                    packages   = $out.packages
-                }
-                $payload | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $cacheFile -Encoding UTF8
-            } catch {}
-        }
-    } else {
-        Stop-Job -Job $job -ErrorAction Ignore
-        Remove-Job -Job $job -Force -ErrorAction Ignore
+        $out.total    = [int]$r.Updates.Count
+        $out.security = [int]$sec
+        $out.packages = $pkgs.ToArray()
+        try {
+            $payload = [ordered]@{
+                fetched_at = (Get-Date).ToUniversalTime().ToString('o')
+                total      = $out.total
+                security   = $out.security
+                packages   = $out.packages
+            }
+            $payload | ConvertTo-Json -Depth 6 -Compress |
+                Set-Content -LiteralPath $cacheFile -Encoding UTF8
+        } catch {}
+    } catch {
+        # COM not reachable / search refused (group policy / no WU service).
+        # Leave totals at zero; reboot_required already populated above.
     }
     return $out
 }
@@ -778,9 +770,23 @@ function Build-Envelope {
     $caps = Get-InvCapabilities
     $sysInfo = Get-InvSystemInfo
     $osFields = Get-InvOsFields
-    $stateDir = "$env:ProgramData\PingReportsAgent\state"
-    if (-not (Test-Path $stateDir)) { $stateDir = "$env:LOCALAPPDATA\PingReportsAgent\state" }
-    New-Item -ItemType Directory -Force -Path $stateDir -ErrorAction Ignore | Out-Null
+    # State dir resolution: prefer ProgramData (production install, SYSTEM
+    # writable), fall back to LOCALAPPDATA (user-mode dev install). Test-Path
+    # alone is not enough — the dir may exist as SYSTEM-owned and not be
+    # writable for the current user — so we actually try to write a probe
+    # file and fall back on failure.
+    $stateDir = $null
+    foreach ($candidate in @("$env:ProgramData\PingReportsAgent\state", "$env:LOCALAPPDATA\PingReportsAgent\state")) {
+        try {
+            New-Item -ItemType Directory -Force -Path $candidate -ErrorAction Stop | Out-Null
+            $probe = Join-Path $candidate '.writable-probe'
+            '' | Set-Content -LiteralPath $probe -Encoding ASCII -ErrorAction Stop
+            Remove-Item -LiteralPath $probe -Force -ErrorAction Ignore
+            $stateDir = $candidate
+            break
+        } catch {}
+    }
+    if (-not $stateDir) { $stateDir = "$env:TEMP\PingReportsAgent-state" ; New-Item -ItemType Directory -Force -Path $stateDir -ErrorAction Ignore | Out-Null }
 
     $inventory = [ordered]@{
         # Top-level OS / hardware fields the server reads off the envelope
