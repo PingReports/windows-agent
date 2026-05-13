@@ -10,6 +10,12 @@ Requires an elevated PowerShell. Drops agent.ps1 into
 %ProgramData%\PingReportsAgent\, writes agent.conf with the supplied env,
 registers a Scheduled Task that fires every 5 minutes as SYSTEM, runs the
 agent once immediately to surface auth/connectivity errors.
+
+The scheduled task action invokes a tiny wscript.exe-hosted VBS launcher
+that in turn launches powershell.exe with a hidden window. wscript runs
+without a console host at all, so the 5-minute task no longer flashes a
+cmd window. (powershell.exe -WindowStyle Hidden alone still flashes a
+brief conhost on every fire under Task Scheduler.)
 #>
 
 [CmdletBinding()]
@@ -43,12 +49,13 @@ if ($AgentId -notmatch '^[0-9a-fA-F-]{32,36}$') {
     throw "PR_AGENT_ID does not look like a UUID: $AgentId"
 }
 
-$Root      = "$env:ProgramData\PingReportsAgent"
-$AgentFile = Join-Path $Root 'agent.ps1'
-$ConfFile  = Join-Path $Root 'agent.conf'
-$VerFile   = Join-Path $Root 'VERSION'
-$LogFile   = Join-Path $Root 'agent.log'
-$TaskName  = 'PingReports Agent'
+$Root         = "$env:ProgramData\PingReportsAgent"
+$AgentFile    = Join-Path $Root 'agent.ps1'
+$ConfFile     = Join-Path $Root 'agent.conf'
+$VerFile      = Join-Path $Root 'VERSION'
+$LogFile      = Join-Path $Root 'agent.log'
+$LauncherFile = Join-Path $Root 'agent-launcher.vbs'
+$TaskName     = 'PingReports Agent'
 $RepoBase  = "https://raw.githubusercontent.com/PingReports/windows-agent/$Branch"
 
 Write-Host "[+] Installing PingReports Windows agent into $Root"
@@ -102,12 +109,31 @@ try {
     Write-Warning "Could not register PingReports-Agent event source: $($_.Exception.Message)"
 }
 
-# Schedule the task: every 5 minutes, run as SYSTEM. Use plain schtasks
-# instead of the PowerShell scheduling cmdlets so this installer works on
-# Windows 10 / Server 2016+ without the ScheduledTasks module quirks.
+# Write the wscript-hosted launcher. wscript.exe runs without a console
+# host so the 5-minute task fires invisibly. The third arg (0) hides the
+# spawned PowerShell process; the fourth (False) is fire-and-forget.
+# $AgentFile / $ConfFile come from %ProgramData% expansion — controlled
+# paths, no `"` to escape, but we still hard-fail later if either path
+# unexpectedly contains a double-quote.
+foreach ($p in @($AgentFile, $ConfFile)) {
+    if ($p -match '"') { throw "Refusing to embed path containing double-quote into VBS launcher: $p" }
+}
 $psPath = (Get-Command powershell.exe).Source
-$execCmd = "`"$psPath`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$AgentFile`""
-$execCmdLogged = $execCmd + " *>> `"$LogFile`""
+$launcherBody = @"
+' PingReports agent launcher. wscript.exe runs without ever creating a
+' console host, so the 5-minute scheduled task no longer flashes a cmd
+' window. The third arg (0) hides the spawned PowerShell process; the
+' fourth (False) makes the launch fire-and-forget.
+Set sh = CreateObject("WScript.Shell")
+sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""$AgentFile"" -ConfigPath ""$ConfFile""", 0, False
+"@
+$launcherBody | Set-Content -LiteralPath $LauncherFile -Encoding ASCII
+
+# Lock the launcher down to admins + SYSTEM. Same posture as the rest of
+# the install dir — non-admin users can read but not modify.
+try {
+    icacls $LauncherFile /inheritance:r /grant:r 'NT AUTHORITY\SYSTEM:(RX)' 'BUILTIN\Administrators:(F)' 'BUILTIN\Users:(R)' /Q | Out-Null
+} catch {}
 
 Write-Host "[+] Registering scheduled task '$TaskName'"
 schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
@@ -116,7 +142,7 @@ schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
 $startMin = (Get-Date).AddSeconds(30 + $rand).ToString('HH:mm')
 $null = schtasks /Create `
     /TN $TaskName `
-    /TR "$psPath -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$AgentFile`"" `
+    /TR "wscript.exe `"$LauncherFile`"" `
     /SC MINUTE /MO 5 `
     /ST $startMin `
     /RU SYSTEM /RL HIGHEST `
@@ -129,8 +155,11 @@ Write-Host "[+] Triggering first run now to verify connectivity..."
 schtasks /Run /TN $TaskName | Out-Null
 Start-Sleep -Seconds 6
 
-# Try a synchronous smoke run as well so failures land in the installer's
-# console (the scheduled task swallows stdout into the event log).
+# Synchronous smoke run so failures land in the installer's console
+# (the scheduled task swallows stdout into the event log). We invoke
+# powershell directly here — the VBS launcher is only there to suppress
+# the conhost flash on recurring Task Scheduler firings; in the
+# installer's foreground we WANT stdout.
 Write-Host '[+] Smoke run (synchronous):'
 & $psPath -NoProfile -ExecutionPolicy Bypass -File $AgentFile
 
